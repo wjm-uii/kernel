@@ -7,7 +7,24 @@
  *  Copyright (C) 1991-2002  Linus Torvalds
  *  Copyright (C) 1998-2024  Ingo Molnar, Red Hat
  */
-#define INSTANTIATE_EXPORTED_MIGRATE_DISABLE
+
+
+ /*
+ 实现了 CPU 调度器最关键的机制：任务唤醒、入队出队、抢占、执行切换、
+ CPU 迁移、热插拔、tick 处理等。它不是“单独一个函数文件”，而是整个 scheduler 的主引擎。
+
+可以分成 8 个大块：
+运行队列与核心调度状态
+时钟与高分辨率 tick
+唤醒和重调度
+任务状态和 CPU 亲和性
+迁移与负载均衡
+调度循环与真正的切换
+预取/抢占/动态 preempt
+初始化、热插拔和调试
+
+ */
+#define INSTANTIATE_EXPORTED_MIGRATE_DISABLE //表示该文件中定义了这个值
 #include <linux/sched.h>
 #include <linux/highmem.h>
 #include <linux/hrtimer_api.h>
@@ -70,7 +87,7 @@
 #include <linux/workqueue_api.h>
 #include <linux/livepatch_sched.h>
 
-#ifdef CONFIG_PREEMPT_DYNAMIC
+#ifdef CONFIG_PREEMPT_DYNAMIC // 判断是否定义了这个值，是就是true
 # ifdef CONFIG_GENERIC_IRQ_ENTRY
 #  include <linux/irq-entry-common.h>
 # endif
@@ -84,7 +101,7 @@
 
 #define CREATE_TRACE_POINTS
 #include <linux/sched/rseq_api.h>
-#include <trace/events/sched.h>
+#include <trace/events/sched.h>//在这个文件里面会先创建好EXPORT_TRACEPOINT_SYMBOL_GPL所使用的模块
 #include <trace/events/ipi.h>
 #undef CREATE_TRACE_POINTS
 
@@ -127,6 +144,120 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_dl_replenish_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_dl_update_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_dl_server_start_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_dl_server_stop_tp);
+
+/*
+完整的运行逻辑
+1. 跳转到sched.h中调用DECLARE_TRACE。
+2. 在sched.h中，DECLARE_TRACE会先顺序正常执行跳转到tracepoint.h中.
+3. 执行到sched.h最后一行#include <trace/define_trace.h>，会触发CONFIG_PREEMPT_DYNAMIC，DECLARE_TRACE会被重定义为DEFINE_TRACE(name##_tp, PARAMS(proto), PARAMS(args))，
+		也就是在sched.h中会被替换为DEFINE_TRACE(pelt_cfs_tp, PARAMS(proto), PARAMS(args))。
+注意：EXPORT_TRACEPOINT_SYMBOL_GPL给外部需要先声明好的模块pelt_cfs_tp，这个不是调用入口。
+
+
+这行代码的作用是将名为 pelt_cfs_tp 的静态跟踪点（Tracepoint）导出给外部内核模块使用，且仅限 GPL 协议授权的模块访问与挂钩。
+核心拆解：
+EXPORT_SYMBOL_GPL：内核符号导出宏。带有 _GPL 后缀表示该符号具有许可限制，
+只有声明了 GPL 兼容协议（即代码中包含 MODULE_LICENSE("GPL")）的内核模块在加载时才能解析并调用它。
+TRACEPOINT：专门用于导出 Tracepoint 机制生成的底层结构体与控制符号，
+允许动态加载的内核模块将自定义的探针函数（Probe Function）注册到该跟踪点上。
+pelt_cfs_tp：具体的跟踪点名称。其中 PELT 指 Per-Entity Load Tracking（单实体负载跟踪机制），
+CFS 指 Completely Fair Scheduler（完全公平调度器）。该跟踪点用于暴露调度器内部负载计算的事件。
+
+EXPORT_TRACEPOINT_SYMBOL_GPL的使用方式
+eg:  
+1. 定义并导出 Tracepoint（提供方）
+
+在内核源码或核心模块中，创建头文件 my_trace.h 声明跟踪点：
+#undef TRACE_SYSTEM
+#define TRACE_SYSTEM my_subsystem
+
+#if !defined(_MY_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
+#define _MY_TRACE_H
+
+#include <linux/tracepoint.h>
+
+// 声明 Tracepoint 结构与参数
+DECLARE_TRACE(my_event,
+    TP_PROTO(int val, const char *msg),
+    TP_ARGS(val, msg)
+);
+
+#endif
+#include <trace/define_trace.h>
+
+在 C 源文件中实例化、导出并触发事件：
+#include <linux/module.h>
+#include "my_trace.h"
+
+MODULE_LICENSE("GPL");
+
+// 1. 实例化 __tracepoint_my_event 结构体
+DEFINE_TRACE(my_event);
+
+// 2. 将 __tracepoint_my_event 导出给其他 GPL 模块
+EXPORT_TRACEPOINT_SYMBOL_GPL(my_event);
+
+void do_work(void) {
+    // 3. 触发 Tracepoint，传入数据
+    trace_my_event(42, "hello tracepoint");
+}
+
+2. 订阅与挂载探针（消费方模块）
+在另一个独立编写的内核模块中，注册回调函数（Probe）来监听该事件：
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include "my_trace.h" // 必须包含相同的 Tracepoint 声明头文件
+
+MODULE_LICENSE("GPL"); // 必须声明 GPL 许可，否则无法调用 GPL 符号
+
+// 探针回调函数：首个参数固定为 void *data，后续参数与 TP_PROTO 一致
+static void my_event_probe(void *data, int val, const char *msg) {
+    pr_info("Tracepoint caught! val=%d, msg=%s\n", val, msg);
+}
+
+static int __init probe_init(void) {
+    // register_trace_<name> 是由 DECLARE_TRACE 自动生成的内联辅助函数
+    int ret = register_trace_my_event(my_event_probe, NULL);
+    if (ret) {
+        pr_err("Failed to register probe\n");
+        return ret;
+    }
+    pr_info("Probe registered successfully\n");
+    return 0;
+}
+
+static void __exit probe_exit(void) {
+    // 注销探针
+    unregister_trace_my_event(my_event_probe, NULL);
+    // 确保所有正在执行的回调完全退出，防止卸载模块时发生 Crash
+    tracepoint_synchronize_unregister();
+}
+
+module_init(probe_init);
+module_exit(probe_exit);
+
+关键注意事项
+
+自动生成辅助函数：包含 DECLARE_TRACE 的头文件会自动生成 register_trace_<name> 
+和 unregister_trace_<name> 两个内联 API，使用者无需直接操作 struct tracepoint。
+参数匹配：探针函数的参数列表首位固定为 void *priv（对应注册时传入的第二个私有数据指针），后续参数必须与 TP_PROTO 的定义严格保持一致。
+许可校验：如果消费方模块没有写 MODULE_LICENSE("GPL")，在加载模块（insmod）时内核会直接拦截并报 Unknown symbol 错误。
+
+####
+为什么在这个案例中没有
+eg:
+DECLARE_TRACE(pelt_rt_tp,
+    TP_PROTO(struct rq *rq),
+    TP_ARGS(rq)
+);
+explained: 
+为什么 core.c 中是 pelt_rt_tp：
+这是 Linux 内核调度器（PELT）演进过程中的命名规范差异。这类没有对应 sysfs 事件的跟踪点被称为  Bare Tracepoint （裸跟踪点）。
+内核在某些补丁或版本中，为了防止符号冲突并明确其 Tracepoint 属性，会在导出层或别名宏中加上 _tp 后缀
+（如在 kernel/sched/sched.h 或 pelt.h 中通过宏进行了 pelt_rt_tp 的桥接映射）。
+
+*/
+
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 DEFINE_PER_CPU(struct rnd_state, sched_rnd_state);

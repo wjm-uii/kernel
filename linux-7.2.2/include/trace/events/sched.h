@@ -833,6 +833,41 @@ TRACE_EVENT(sched_wake_idle_without_ipi,
 DECLARE_TRACE(pelt_cfs,
 	TP_PROTO(struct cfs_rq *cfs_rq),
 	TP_ARGS(cfs_rq));
+/*
+// 声明 Tracepoint 结构与参数
+eg:
+DECLARE_TRACE(my_event,
+    TP_PROTO(int val, const char *msg),
+    TP_ARGS(val, msg)
+);
+
+未找到DEFINE_TRACE(pelt_cfs，只找到DECLARE_TRACE(pelt_cfs,
+ 
+找不到 DEFINE_TRACE(pelt_cfs) 是正常现象。Linux 内核的 Tracepoint 机制采用了“只声明、不手写定义”的设计，
+DEFINE_TRACE 是在编译预处理阶段由宏自动重定义生成的，而非源码中手动编写的文本。
+1. 内核的“二次展开”宏机制
+内核为了避免开发者既要在 .h 中写 DECLARE_TRACE、又要在 .c 中写 DEFINE_TRACE 导致冗余和同步困难，设计了如下生成逻辑：
+在头文件（如 include/trace/events/sched.h）中，只写一行 DECLARE_TRACE(pelt_cfs, ...) 声明原型。
+在负责实例化跟踪点的 .c 文件（如调度器核心代码）中，包含该头文件之前会定义 #define CREATE_TRACE_POINTS。
+当预处理器检测到 CREATE_TRACE_POINTS 时，引用的 <trace/define_trace.h> 会通过 #undef DECLARE_TRACE 取消声明宏，并把 DECLARE_TRACE 重定义为 DEFINE_TRACE。
+2. 为什么 pelt_cfs 用 DECLARE_TRACE 而不是 TRACE_EVENT
+普通的内核 Tracepoint（如 sched_switch）使用 TRACE_EVENT 宏，因为它需要为 Ftrace 缓冲区生成数据结构和格式化打印函数。  
+pelt_cfs 是 PELT（Per-Entity Load Tracking， CFS 调度器负载跟踪）内部使用的轻量级跟踪点，仅用于探针挂载和回调触发，不需要复杂的 Ftrace 文本输出逻辑，因此直接使用了最底层的 DECLARE_TRACE 宏。
+3. 内存实体实际生成的位置在内核源码中，只要找到包含 sched.h 且定义了 CREATE_TRACE_POINTS 的 C 文件：C
+#define CREATE_TRACE_POINTS
+#include <trace/events/sched.h>
+当编译器编译这个 C 文件时，预处理器就会自动将 sched.h 里的 DECLARE_TRACE(pelt_cfs, ...) 展开为 DEFINE_TRACE(pelt_cfs, ...)，
+并在此处分配真实内存与符号。这就是在源码文本中全局搜索不到 DEFINE_TRACE(pelt_cfs 的根本原因
+
+Add _tp 
+需要查看： include/trace/define_trace.h
+#undef DECLARE_TRACE
+#define DECLARE_TRACE(name, proto, args)	\
+	DEFINE_TRACE(name##_tp, PARAMS(proto), PARAMS(args))
+
+
+*/
+
 
 DECLARE_TRACE(pelt_rt,
 	TP_PROTO(struct rq *rq),
@@ -926,3 +961,62 @@ DECLARE_TRACE(sched_dl_server_stop,
 
 /* This part must be outside protection */
 #include <trace/define_trace.h>
+
+/*
+
+DECLARE_TRACE 本身不会去调用 define_trace.h。相反，是 define_trace.h 依靠预处理器技巧，反向“操控”并重定义了 DECLARE_TRACE。
+
+这种写法是 Linux 内核利用 C 预处理器实现“同一份头文件，读取两次（Two-Pass）”的经典黑魔法，目的是用一行代码同时完成接口声明和物理内存分配。
+
+为什么 #include <trace/define_trace.h> 必须放在 #endif 外面？
+标准的 C 头文件都有防重复包含卫士（#ifndef _MY_TRACE_H ... #endif）。如果把 define_trace.h 放在 #endif 里面，这个头文件在编译时就只能被读取一次。
+
+把它放在 #endif 外面，能保证每次包含 sched.h 时，末尾的 define_trace.h 都会被强制执行。
+
+两次读取（Two-Pass）的真实运作流程
+define_trace.h 在末尾会根据当前 .c 文件是否开启了开关，决定要不要发起“第二次读取”：
+
+1. 第一次读取（普通声明阶段——绝大多数 .c 文件）
+
+当普通 C 文件直接 #include "sched.h" 时：
+
+未定义 CREATE_TRACE_POINTS 宏。
+
+进入 #ifndef _MY_TRACE_H 区域，<linux/tracepoint.h> 里的 DECLARE_TRACE 展开为 extern 变量声明 和 static inline trace_my_event() 内联函数。
+
+代码运行到 #endif 外侧，执行末尾的 define_trace.h。
+
+define_trace.h 检查发现没有 CREATE_TRACE_POINTS 开关，直接退出，什么都不做。
+
+结果：只生成了代码接口，不占用物理内存。
+
+2. 第二次读取（实体分配阶段——有且仅有一个 .c 文件）
+
+当某个 C 文件写了 #define CREATE_TRACE_POINTS 再 #include "sched.h" 时：
+
+完成上述的“第一次读取”。
+
+代码运行到末尾，再次进入 define_trace.h。
+
+define_trace.h 检测到开启了 CREATE_TRACE_POINTS，立刻启动“变脸”流程：
+
+取消定义：执行 #undef DECLARE_TRACE。
+
+重定义：将 DECLARE_TRACE 重新定义为展开成 DEFINE_TRACE（真正分配内存的宏）。
+
+破除防重复保护：定义 TRACE_HEADER_MULTI_READ 并执行 #undef _MY_TRACE_H。
+
+反向包含：在 define_trace.h 内部写下一行 #include "sched.h"！
+
+sched.h 被强制第二次读取。这一次，由于 DECLARE_TRACE 已经被改掉，代码中的 DECLARE_TRACE(my_event, ...) 展开成了 DEFINE_TRACE(my_event, ...)。
+
+结果：在此 .c 文件中真正分配了 struct tracepoint __tracepoint_my_event 结构体的全局内存。
+
+核心目的
+内核采用这种看似迂回的写法，是为了把繁琐的黑魔法封印在框架底层。
+
+开发者只需要在一个 .h 文件中写一次 DECLARE_TRACE，框架就会自动在头文件里生成 API，并在指定 .c 中分配内存，无需手动在 .c 文件里再去重复写 DEFINE_TRACE。
+
+
+*/
+
