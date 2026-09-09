@@ -282,6 +282,33 @@ static int __init setup_proxy_exec(char *str)
 	}
 	return 1;
 }
+/*
+static：作用域限制。表明该函数仅在当前的 .c 源文件（编译单元）内可见，不能被其他内核文件直接调用，防止全局函数符号重名冲突。
+int：返回值类型。在 Linux 内核参数解析机制中，返回 1 通常表示该启动参数已被成功接收和解析；返回 0 则表示解析失败或参数无效。
+__init：内核专用宏/段属性。它会被扩展为 __attribute__((__section__(".init.text")))。
+	内存优化：标记为 __init 的函数只会存在于内核启动阶段的特殊内存区域（.init.text）中。
+	释放内存：当内核完成引导启动后，该内存区域的代码会被自动清理并释放回系统 RAM（即常见的 Freeing unused kernel image memory 阶段），以节省运行期内存。
+setup_proxy_exec：函数名称。  
+	业务含义：该函数用于处理内核调度器中的 Proxy Execution（代理执行机制） 配置。
+	代理执行是一种解决互斥锁优先级翻转（Priority Inversion）的技术，允许持锁线程“借用”被阻塞线程的调度上下文来加快执行。(char *str)：
+参数指针。指向从 Bootloader（如 GRUB、U-Boot）传入内核的命令行参数字符串（即 sched_proxy_exec= 等号后面的内容，如 "1"、"0"、"on" 或 "off"）。
+
+实际配合的使用场景
+在内核代码中，该函数通常会与 __setup 宏配对使用：
+// 注册启动参数 handler
+__setup("sched_proxy_exec=", setup_proxy_exec);
+当系统启动参数包含 sched_proxy_exec=1 时，内核在引导初期就会调用 setup_proxy_exec("1")，并将根据传入的字符串开启或关闭该调度特性。启动完成后，该函数占据的内存即被回收。
+
+函数本身的展开代码
+static int __attribute__((__section__(".init.text"))) __attribute__((__cold__)) setup_proxy_exec(char *str)
+1.作用域修饰符 (static)：限定函数作用域仅在当前的 .c 文件内，防止与其他源文件中的重名函数冲突。
+2.返回值类型 (int)：函数的返回值为整数，内核解析函数通常约定用 1 表示解析成功，0 表示失败。
+3.内存段位置属性 (__attribute__((__section__(".init.text"))))：告诉编译器把该函数的机器码放入专门的 .init.text 内存段，以便系统启动完成后回收这部分 RAM。
+4.编译器优化属性 (__attribute__((__cold__)))：告知 GCC 该函数只在初始化时执行一次（冷代码），编译器据此做出分支预测优化，并将其移出主代码热区以减少 CPU 缓存污染。
+5.函数标识符 (setup_proxy_exec)：函数的名称，内核会通过函数指针调用它
+6.参数列表 ((char *str))：接收一个字符指针，指向 Bootloader 传给内核的具体启动参数字符串（如 "1" 或 "off"）。
+
+*/
 #else
 static int __init setup_proxy_exec(char *str)
 {
